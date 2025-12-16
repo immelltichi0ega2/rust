@@ -955,15 +955,21 @@ impl Step for Enzyme {
             return out_dir;
         }
 
+        let llvm_cmake_dir = builder.llvm_out(target).join("lib/cmake/llvm");
+        if !builder.config.dry_run() && !llvm_cmake_dir.is_dir() {
+            builder.info(&format!(
+                "WARNING: {} does not exist, Enzyme build will likely fail",
+                llvm_cmake_dir.display()
+            ));
+        }
+
         trace!(?target, "(re)building enzyme artifacts");
         builder.info(&format!("Building Enzyme for {target}"));
         t!(stamp.remove());
         let _time = helpers::timeit(builder);
         t!(fs::create_dir_all(&out_dir));
 
-        builder
-            .config
-            .update_submodule(Path::new("src").join("tools").join("enzyme").to_str().unwrap());
+        builder.config.update_submodule("src/tools/enzyme");
         let mut cfg = cmake::Config::new(builder.src.join("src/tools/enzyme/enzyme/"));
         configure_cmake(builder, target, &mut cfg, true, LdFlags::default(), &[]);
 
@@ -983,7 +989,7 @@ impl Step for Enzyme {
             .define("LLVM_ENABLE_ASSERTIONS", "ON")
             .define("ENZYME_EXTERNAL_SHARED_LIB", "ON")
             .define("ENZYME_BC_LOADER", "OFF")
-            .define("LLVM_DIR", builder.llvm_out(target));
+            .define("LLVM_DIR", llvm_cmake_dir);
 
         cfg.build();
 
