@@ -14,8 +14,10 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::{env, fs};
 
+use build_helper::exit;
 use build_helper::git::PathFreshness;
 
+use crate::core::build_steps::llvm;
 use crate::core::builder::{Builder, RunConfig, ShouldRun, Step, StepMetadata};
 use crate::core::config::{Config, TargetSelection};
 use crate::utils::build_stamp::{BuildStamp, generate_smart_stamp_hash};
@@ -896,13 +898,28 @@ fn get_var(var_base: &str, host: &str, target: &str) -> Option<OsString> {
         .or_else(|| env::var_os(var_base))
 }
 
+#[derive(Clone)]
+pub struct BuiltEnzyme {
+    /// Path to the libEnzyme dylib.
+    enzyme: PathBuf,
+}
+
+impl BuiltEnzyme {
+    pub fn enzyme_path(&self) -> PathBuf {
+        self.enzyme.clone()
+    }
+    pub fn enzyme_filename(&self) -> String {
+        self.enzyme.file_name().unwrap().to_str().unwrap().to_owned()
+    }
+}
+
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct Enzyme {
     pub target: TargetSelection,
 }
 
 impl Step for Enzyme {
-    type Output = PathBuf;
+    type Output = BuiltEnzyme;
     const IS_HOST: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
@@ -914,16 +931,16 @@ impl Step for Enzyme {
     }
 
     /// Compile Enzyme for `target`.
-    fn run(self, builder: &Builder<'_>) -> PathBuf {
+    fn run(self, builder: &Builder<'_>) -> Self::Output {
         builder.require_submodule(
             "src/tools/enzyme",
             Some("The Enzyme sources are required for autodiff."),
         );
-        if builder.config.dry_run() {
-            let out_dir = builder.enzyme_out(self.target);
-            return out_dir;
-        }
         let target = self.target;
+
+        if builder.config.dry_run() {
+            return BuiltEnzyme { enzyme: builder.config.tempdir().join("enzyme-dryrun") };
+        }
 
         let LlvmResult { host_llvm_config, .. } = builder.ensure(Llvm { target: self.target });
 
@@ -939,6 +956,12 @@ impl Step for Enzyme {
         let out_dir = builder.enzyme_out(target);
         let stamp = BuildStamp::new(&out_dir).with_prefix("enzyme").add_stamp(smart_stamp_hash);
 
+        let llvm_version_major = llvm::get_llvm_version_major(builder, &host_llvm_config);
+        let lib_ext = std::env::consts::DLL_EXTENSION;
+        let libenzyme = format!("libEnzyme-{llvm_version_major}");
+        let build_dir = out_dir.join("lib");
+        let dylib = build_dir.join(&libenzyme).with_extension(lib_ext);
+
         trace!("checking build stamp to see if we need to rebuild enzyme artifacts");
         if stamp.is_up_to_date() {
             trace!(?out_dir, "enzyme build artifacts are up to date");
@@ -952,7 +975,15 @@ impl Step for Enzyme {
                     stamp.path().display()
                 ));
             }
-            return out_dir;
+            return BuiltEnzyme { enzyme: dylib };
+        }
+
+        let llvm_cmake_dir = builder.llvm_out(target).join("lib/cmake/llvm");
+        if !builder.config.dry_run() && !llvm_cmake_dir.is_dir() {
+            builder.info(&format!(
+                "WARNING: {} does not exist, Enzyme build will likely fail",
+                llvm_cmake_dir.display()
+            ));
         }
 
         trace!(?target, "(re)building enzyme artifacts");
@@ -961,9 +992,6 @@ impl Step for Enzyme {
         let _time = helpers::timeit(builder);
         t!(fs::create_dir_all(&out_dir));
 
-        builder
-            .config
-            .update_submodule(Path::new("src").join("tools").join("enzyme").to_str().unwrap());
         let mut cfg = cmake::Config::new(builder.src.join("src/tools/enzyme/enzyme/"));
         configure_cmake(builder, target, &mut cfg, true, LdFlags::default(), &[]);
 
@@ -983,12 +1011,22 @@ impl Step for Enzyme {
             .define("LLVM_ENABLE_ASSERTIONS", "ON")
             .define("ENZYME_EXTERNAL_SHARED_LIB", "ON")
             .define("ENZYME_BC_LOADER", "OFF")
-            .define("LLVM_DIR", builder.llvm_out(target));
+            .define("LLVM_DIR", llvm_cmake_dir);
 
         cfg.build();
 
+        // At this point, `out_dir` should contain the built libEnzyme-<LLVM-version>.<dylib-ext>
+        // file.
+        if !dylib.exists() {
+            eprintln!(
+                "`{libenzyme}` not found in `{}`. Either the build has failed or Enzyme was built with a wrong version of LLVM",
+                build_dir.display()
+            );
+            exit!(1);
+        }
+
         t!(stamp.write());
-        out_dir
+        BuiltEnzyme { enzyme: dylib }
     }
 }
 
